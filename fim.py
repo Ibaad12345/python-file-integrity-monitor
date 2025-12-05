@@ -1,216 +1,262 @@
-import configparser
-import sys
-from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 import hashlib
 import sqlite3
-import argparse
 import os
+from pathlib import Path
 
-# --- The Hashing Engine (No changes) ---
-def get_file_hash(file_path):
-    """Calculates the SHA-256 hash of a file."""
+# --- CORE LOGIC (Functions omitted for brevity, assume they are correct) ---
+
+def calculate_file_hash(filepath):
+    """Calculates SHA-256 hash."""
     sha256_hash = hashlib.sha256()
     try:
-        with open(file_path, 'rb') as f:
+        with open(filepath, "rb") as f:
             while chunk := f.read(4096):
                 sha256_hash.update(chunk)
         return sha256_hash.hexdigest()
-    except PermissionError:
-        return "PERMISSION_DENIED"
-    except FileNotFoundError:
-        return "FILE_NOT_FOUND"
     except Exception as e:
-        return f"ERROR: {e}"
+        return "ERROR"
 
-# --- The Database Setup (No changes) ---
-def init_database(db_path):
-    """Creates the baseline.db file and a 'files' table."""
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
+def init_db():
+    """Ensures the DB exists."""
+    conn = sqlite3.connect("baseline.db")
+    cursor = conn.cursor()
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS files (
             path TEXT PRIMARY KEY,
             hash TEXT
         )
-        ''')
-        cursor.execute("DELETE FROM files")
-        conn.commit()
-        print(f"Database '{db_path}' initialized.")
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        sys.exit(1)
-    finally:
-        if conn:
-            conn.close()
+    ''')
+    conn.commit()
+    conn.close()
 
-# --- NEW FUNCTION: Load Baseline into Memory ---
-def load_baseline(db_path):
-    """Loads the baseline from the database into a dictionary for fast lookups."""
-    baseline = {}
-    if not os.path.exists(db_path):
-        print(f"Error: Baseline database '{db_path}' not found.")
-        print("Please run --init first.")
-        sys.exit(1)
+# --- THE GUI APPLICATION CLASS ---
+
+class FIMApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Python File Integrity Monitor")
+        self.root.geometry("900x600")
+
+        # Initialize Database
+        init_db()
+
+        # --- 1. Top Control Panel (Adding files/folders) ---
+        control_frame = ttk.LabelFrame(root, text="Configuration")
+        control_frame.pack(fill="x", padx=10, pady=5)
+
+        btn_add_folder = ttk.Button(control_frame, text="Add Folder", command=self.add_folder)
+        btn_add_folder.pack(side="left", padx=5, pady=5)
+
+        btn_add_file = ttk.Button(control_frame, text="Add Single File", command=self.add_file)
+        btn_add_file.pack(side="left", padx=5, pady=5)
+
+        btn_remove = ttk.Button(control_frame, text="Remove Selected", command=self.remove_selected)
+        btn_remove.pack(side="left", padx=5, pady=5)
+
+        btn_clear = ttk.Button(control_frame, text="Clear List", command=self.clear_list)
+        btn_clear.pack(side="right", padx=5, pady=5)
+
+        # --- 2. Main Display Area (The Treeview) ---
+        self.tree = ttk.Treeview(root, columns=("Path", "Status", "Hash"), show="headings")
         
-    try:
-        conn = sqlite3.connect(db_path)
+        # Define Column Headings
+        self.tree.heading("Path", text="File Path")
+        self.tree.heading("Status", text="Status")
+        self.tree.heading("Hash", text="SHA-256 Hash")
+
+        # Define Column Widths
+        self.tree.column("Path", width=500)
+        self.tree.column("Status", width=100)
+        self.tree.column("Hash", width=250)
+
+        # Add a Scrollbar
+        scrollbar = ttk.Scrollbar(root, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscroll=scrollbar.set)
+        
+        scrollbar.pack(side="right", fill="y")
+        self.tree.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # Define Colors for Status tags
+        self.tree.tag_configure("modified", foreground="red", background="#ffe6e6") # Light red bg
+        self.tree.tag_configure("new", foreground="green", background="#e6ffe6")    # Light green bg
+        self.tree.tag_configure("deleted", foreground="gray")
+        self.tree.tag_configure("error", foreground="orange")
+        self.tree.tag_configure("ok", foreground="black")
+
+        # --- 3. Bottom Action Panel (Baseline & Scan) ---
+        action_frame = ttk.Frame(root)
+        action_frame.pack(fill="x", padx=10, pady=10)
+
+        btn_baseline = ttk.Button(action_frame, text="Update Baseline (Commit Changes)", command=self.update_baseline)
+        btn_baseline.pack(side="left", fill="x", expand=True, padx=5)
+
+        btn_scan = ttk.Button(action_frame, text="Scan Now (Check Integrity)", command=self.scan_files)
+        btn_scan.pack(side="left", fill="x", expand=True, padx=5)
+
+        # Load existing data if available
+        self.load_from_db_to_ui()
+
+    # --- INTERFACE FUNCTIONS ---
+
+    def add_folder(self):
+        folder_selected = filedialog.askdirectory()
+        if folder_selected:
+            # Walk the folder and add all files
+            count = 0
+            for root_dir, dirs, files in os.walk(folder_selected):
+                for file in files:
+                    full_path = os.path.join(root_dir, file)
+                    # Avoid duplicates
+                    if not self.is_in_tree(full_path):
+                        self.tree.insert("", "end", values=(full_path, "Pending", ""))
+                        count += 1
+            messagebox.showinfo("Success", f"Added {count} files from folder.")
+
+    def add_file(self):
+        files_selected = filedialog.askopenfilenames()
+        if files_selected:
+            for file in files_selected:
+                if not self.is_in_tree(file):
+                    self.tree.insert("", "end", values=(file, "Pending", ""))
+
+    def remove_selected(self):
+        """Removes selected files from the UI AND deletes them from the database."""
+        selected_items = self.tree.selection()
+        
+        if not selected_items:
+            messagebox.showwarning("Warning", "No files selected.")
+            return
+
+        conn = sqlite3.connect("baseline.db")
         cursor = conn.cursor()
         
-        # Select all records from the 'files' table
-        cursor.execute("SELECT path, hash FROM files")
-        records = cursor.fetchall()
-        
-        # Store in a dictionary: {'filepath': 'hash'}
-        for record in records:
-            baseline[record[0]] = record[1]
+        for item in selected_items:
+            # 1. Get the file path from the selected row (Value in the 'Path' column)
+            filepath = self.tree.item(item)['values'][0]
             
-        print(f"Loaded {len(baseline)} files from the baseline.")
-        return baseline
-        
-    except sqlite3.Error as e:
-        print(f"Database error loading baseline: {e}")
-        sys.exit(1)
-    finally:
-        if conn:
-            conn.close()
+            # 2. Delete the record from the database
+            cursor.execute("DELETE FROM files WHERE path=?", (filepath,))
+            
+            # 3. Delete the row from the UI Treeview
+            self.tree.delete(item)
+            
+        conn.commit()
+        conn.close()
+        messagebox.showinfo("Removed", f"Removed {len(selected_items)} files from the monitoring list and database.")
 
-# --- This is the main "entry point" of your script ---
-def main():
-    
-    # --- UPDATED: Add --scan to the "Menu" ---
-    parser = argparse.ArgumentParser(description="A simple File Integrity Monitor.")
-    parser.add_argument(
-        '--init', 
-        action='store_true', 
-        help="Initialize the baseline database. Deletes all existing data."
-    )
-    # ADD THIS NEW ARGUMENT
-    parser.add_argument(
-        '--scan', 
-        action='store_true', 
-        help="Scan files against the baseline."
-    )
-    
-    args = parser.parse_args()
-    
-    # --- 1. Read Config File (No changes) ---
-    config = configparser.ConfigParser()
-    try:
-        config.read('config.ini')
-    except FileNotFoundError:
-        print("ERROR: config.ini file not found. Exiting.")
-        sys.exit(1)
-
-    try:
-        dir_to_watch_str = config.get('MonitorSettings', 'directory_to_watch')
-        ignore_extensions_str = config.get('MonitorSettings', 'file_extensions_to_ignore')
-        extensions_to_ignore = [ext.strip() for ext in ignore_extensions_str.split(',')]
-    except (configparser.NoOptionError, configparser.NoSectionError) as e:
-        print(f"ERROR: Problem with config.ini - {e}")
-        sys.exit(1)
-
-    # Database file name
-    db_file = "baseline.db"
-
-    # --- Logic for --init mode (No changes) ---
-    if args.init:
-        print("--- Initializing Baseline ---")
-        
-        init_database(db_file)
-        
-        try:
-            conn = sqlite3.connect(db_file)
+    def clear_list(self):
+        """Clears the entire UI list and completely wipes the database."""
+        if messagebox.askyesno("Confirm", "⚠️ WARNING: Clear ALL files from monitor and wipe the baseline database?"):
+            
+            # 1. Clear the entire database table
+            conn = sqlite3.connect("baseline.db")
             cursor = conn.cursor()
-            directory_path = Path(dir_to_watch_str)
-            if not directory_path.exists():
-                print(f"ERROR: Directory not found: {directory_path}")
-                sys.exit(1)
-            
-            print(f"Scanning {directory_path} to build baseline...")
-            
-            for file_path in directory_path.rglob('*'):
-                if file_path.is_file():
-                    if file_path.suffix not in extensions_to_ignore:
-                        current_hash = get_file_hash(file_path)
-                        if "ERROR" not in current_hash:
-                            print(f"  Adding: {file_path.name}")
-                            cursor.execute(
-                                "INSERT INTO files (path, hash) VALUES (?, ?)",
-                                (str(file_path), current_hash)
-                            )
-                        else:
-                            print(f"  (Skipping {file_path.name}: {current_hash})")
-            
+            cursor.execute("DELETE FROM files")
             conn.commit()
-            print("--- Baseline creation complete! ---")
-
-        except sqlite3.Error as e:
-            print(f"Database error during baseline creation: {e}")
-        finally:
-            if conn:
-                conn.close()
-    
-    # --- NEW: Logic for --scan mode ---
-    elif args.scan:
-        print("--- Scanning System Against Baseline ---")
-        
-        # 1. Load the "golden record" into memory
-        baseline = load_baseline(db_file)
-        # Create a copy to track what we've seen
-        baseline_check = baseline.copy()
-
-        # 2. Walk the file system just like in --init
-        directory_path = Path(dir_to_watch_str)
-        if not directory_path.exists():
-            print(f"ERROR: Directory not found: {directory_path}")
-            sys.exit(1)
-        
-        for file_path in directory_path.rglob('*'):
-            if file_path.is_file():
-                if file_path.suffix not in extensions_to_ignore:
-                    
-                    # Convert file_path to string for dictionary lookup
-                    path_str = str(file_path)
-                    
-                    # 3. Calculate the file's CURRENT hash
-                    current_hash = get_file_hash(file_path)
-                    
-                    if "ERROR" in current_hash:
-                        print(f"  (Skipping {file_path.name}: {current_hash})")
-                        continue # Skip to the next file
-
-                    # 4. Compare with the baseline
-                    if path_str in baseline:
-                        # Case 1: File is in the baseline
-                        if current_hash == baseline[path_str]:
-                            # Hashes match - file is OK
-                            pass # We'll just ignore it
-                        else:
-                            # Hashes DON'T match - file was MODIFIED
-                            print(f"[MODIFIED] {path_str}")
-                        
-                        # We've seen this file, so remove it from our check list
-                        if path_str in baseline_check:
-                            del baseline_check[path_str]
-                            
-                    else:
-                        # Case 2: File is NOT in baseline - it's NEW
-                        print(f"[NEW] {path_str}")
-
-        # 5. Check for DELETED files
-        # After the loop, any file *still* in baseline_check was NOT
-        # found during the scan, which means it was DELETED.
-        for path_str in baseline_check:
-            print(f"[DELETED] {path_str}")
+            conn.close()
             
-        print("--- Scan complete ---")
-    
-    else:
-        # If no argument is given, print the help menu
-        print("No action specified. Use --init or --scan.")
-        parser.print_help()
+            # 2. Clear the UI
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            
+            messagebox.showinfo("Cleared", "Monitoring list and baseline database have been wiped.")
 
-# --- This line makes the script run the main() function ---
+
+    def is_in_tree(self, filepath):
+        """Helper to check if file is already in the list."""
+        for item in self.tree.get_children():
+            if self.tree.item(item)['values'][0] == filepath:
+                return True
+        return False
+
+    def load_from_db_to_ui(self):
+        """Loads the database content into the UI on startup."""
+        conn = sqlite3.connect("baseline.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT path, hash FROM files")
+        rows = cursor.fetchall()
+        for row in rows:
+            # Insert with 'OK' status initially
+            self.tree.insert("", "end", values=(row[0], "Monitored", row[1]), tags=("ok",))
+        conn.close()
+
+    # --- LOGIC FUNCTIONS ---
+
+    def update_baseline(self):
+        """Saves the CURRENT list in the UI to the database as the new Baseline."""
+        conn = sqlite3.connect("baseline.db")
+        cursor = conn.cursor()
+        
+        # 1. Clear old DB (Crucial! We only want files currently in the UI)
+        cursor.execute("DELETE FROM files")
+        
+        items = self.tree.get_children()
+        if not items:
+            messagebox.showwarning("Warning", "No files to monitor!")
+            return
+
+        # 2. Loop through UI items, calculate hash, insert to DB
+        count = 0
+        for item in items:
+            values = self.tree.item(item)['values']
+            filepath = values[0]
+            
+            if os.path.exists(filepath):
+                file_hash = calculate_file_hash(filepath)
+                # We INSERT all files currently visible in the UI, creating the new golden record
+                cursor.execute("INSERT INTO files (path, hash) VALUES (?, ?)", (filepath, file_hash))
+                
+                # Update UI to show it's secured
+                self.tree.item(item, values=(filepath, "Secured", file_hash), tags=("ok",))
+                count += 1
+            else:
+                # File in list but doesn't exist on disk
+                self.tree.item(item, values=(filepath, "Missing", "N/A"), tags=("deleted",))
+
+        conn.commit()
+        conn.close()
+        messagebox.showinfo("Baseline Updated", f"Successfully secured {count} files in baseline.")
+
+    def scan_files(self):
+        """Checks files in the UI against their recorded hash in the DB."""
+        conn = sqlite3.connect("baseline.db")
+        cursor = conn.cursor()
+        
+        items = self.tree.get_children()
+        
+        for item in items:
+            values = self.tree.item(item)['values']
+            filepath = values[0]
+            
+            # Get the baseline hash from DB
+            cursor.execute("SELECT hash FROM files WHERE path=?", (filepath,))
+            result = cursor.fetchone()
+            
+            if not result:
+                # File is in UI but not in DB (User added it but didn't click 'Update Baseline')
+                self.tree.item(item, values=(filepath, "Not in Baseline", ""), tags=("new",))
+                continue
+                
+            baseline_hash = result[0]
+            
+            if not os.path.exists(filepath):
+                self.tree.item(item, values=(filepath, "DELETED", baseline_hash), tags=("deleted",))
+                continue
+            
+            current_hash = calculate_file_hash(filepath)
+            
+            if current_hash == baseline_hash:
+                self.tree.item(item, values=(filepath, "OK", current_hash), tags=("ok",))
+            else:
+                self.tree.item(item, values=(filepath, "MODIFIED", current_hash), tags=("modified",))
+                
+        conn.close()
+        messagebox.showinfo("Scan Complete", "Integrity check finished.")
+
+# --- APP STARTUP ---
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = FIMApp(root)
+    root.mainloop()
